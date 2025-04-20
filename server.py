@@ -1,172 +1,208 @@
+"""
+Aditya Dawadikar
+Aniket Mali
+"""
+
+# ========== server.py ==========
+
 import socket
-import threading
+from threading import Thread, Lock
 import time
-import csv
-from datetime import datetime
-import argparse
+import signal
+import sys
 
-class LogColor:
-    BLUE = '\033[96m'
-    GREEN = '\033[92m'
-    RED = '\033[91m'
-    YELLOW = '\033[93m'
-    WHITE = '\033[0m'
+# Constants
+TOTAL = 10_000_000       # Total number of packets expected
+CHUNK = 4                # Sequence increment size
+LIMIT = 65536            # Wrap-around limit for sequence number
 
-HOST = '0.0.0.0'
-PORT = 12345
-BUFFER_SIZE = 1024
-GOODPUT_EVERY_N_PACKETS = 40
+# Global State Variables
+ACK_COUNT = 0            # Acknowledged packet count
+CUR_SEQ = 0              # Current sequence number
+EXPECT = 1               # Next expected sequence number from client
+CID = ''                 # Client ID
+LAGGED = []              # List of missing packets (lagged)
+OBSERVED = []            # Recently observed packet sequence numbers
+YIELD = []               # Placeholder (not used in code)
+SEQ_BATCH = []           # Temporary list for a received batch of packets
+_frag = ''               # Placeholder for incomplete data (unused)
+B_WIDTH = 8192           # Bandwidth size for receiving data
+_last_activity = time.time()  # Timestamp for last client activity
+_server_running = True   # Control server loop
 
-class TCPServer:
-    def __init__(self, enable_logging=False):
-        self.lock = threading.Lock()
-        self.active_clients = 0
-        self.enable_logging = enable_logging
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((HOST, PORT))
-        self.server_socket.listen(5)
-        self.server_socket.settimeout(5.0)
-        print(f"{LogColor.WHITE}[SERVER] Listening on port {PORT}{LogColor.WHITE}")
+# Logs for sequence tracking and efficiency
+sink_seq = open(f"rx_{int(time.time())}.csv", "w")
+sink_seq.write("seq,time\n")
+sink_eff = open(f"efficiency_{int(time.time())}.csv", "w")
+sink_eff.write("received,sent,eff\n")
+sink_flow = open(f"recv_winsz_{int(time.time())}.csv", "w")
+sink_flow.write("recv_win,timestamp\n")
 
-    def handle_client(self, conn, addr):
-        client_id = f"{addr[0]}_{addr[1]}"
-        print(f"\n{LogColor.WHITE}[CLIENT {client_id}] --- New session started ---{LogColor.WHITE}")
+# Locks for thread-safe logging
+report_lock = Lock()
+flow_lock = Lock()
 
-        with self.lock:
-            self.active_clients += 1
+def reset_env():
+    """Reset the server-side state variables."""
+    global ACK_COUNT, CUR_SEQ, EXPECT, LAGGED, OBSERVED, YIELD, SEQ_BATCH
+    ACK_COUNT = 0
+    CUR_SEQ = 0
+    EXPECT = 1
+    LAGGED.clear()
+    OBSERVED.clear()
+    YIELD.clear()
+    SEQ_BATCH.clear()
 
-        recv_packets = set()
-        tot_recv = 0
-        tot_miss = 0
-        recent_recv_count = 0
-        recent_miss_count = 0
+def pulse_monitor():
+    """Monitor server idleness and print status every 5 seconds."""
+    while _server_running:
+        idle_time = time.time() - _last_activity
+        if idle_time > 5:
+            print(f"[.] Server idle for {int(idle_time)}s — ACK_COUNT: {ACK_COUNT}, Lagged: {len(LAGGED)}")
+        time.sleep(5)
 
-        if self.enable_logging:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_file = open(f"server_log_{client_id}_{timestamp}.csv", mode='w', newline='')
-            logger = csv.writer(log_file)
-            logger.writerow(["timestamp", "event", "sequence_numbers", "ack", "good_put"])
-        else:
-            logger = None
+def handle_connection(conn):
+    """Handle initial client handshake and start data streaming."""
+    global ACK_COUNT, CUR_SEQ, EXPECT, CID, _last_activity
 
+    try:
+        hello = conn.recv(2048).decode()
+        _last_activity = time.time()
+        print(f"[*] Incoming: {hello}")
+
+        # Initial SYN or reconnect (RCN) logic
+        if hello.startswith("SYN"):
+            # If a new session or fresh start required
+            if ACK_COUNT < 10 or CID != hello[4:] or ACK_COUNT > TOTAL * 0.99:
+                conn.sendall("NEW".encode())
+                CID = hello[4:]
+                reset_env()
+            else:
+                # Client reconnect
+                conn.sendall("OLD".encode())
+                if conn.recv(2048).decode().startswith("SND"):
+                    conn.sendall(f'{"pkt_rec_cnt": {ACK_COUNT}, "seq_num": {CUR_SEQ}}'.encode())
+        elif hello.startswith("RCN"):
+            conn.sendall("SND".encode())
+            CID = hello[4:]
+            state = eval(conn.recv(4096).decode())
+            ACK_COUNT = state['pkt_success_sent']
+            CUR_SEQ = state['seq_num']
+            EXPECT = CUR_SEQ + CHUNK
+
+        stream(conn)  # Start receiving packets
+
+    except Exception as e:
+        print("[!] Handshake/stream error:", e)
+    finally:
         try:
-            initial_msg = conn.recv(BUFFER_SIZE).decode()
-            if initial_msg:
-                print(f"{LogColor.WHITE}[CLIENT {client_id}] Received handshake: {initial_msg}{LogColor.WHITE}")
-                conn.send("success".encode())
+            conn.shutdown(socket.SHUT_RDWR)
+        except:
+            pass
+        conn.close()
+        print("[*] Connection closed. Waiting for next client...")
 
-            buffer = ""
-            while True:
-                chunk = conn.recv(BUFFER_SIZE).decode()
-                if not chunk:
-                    break
+def stream(conn):
+    """Receive stream of sequence packets from client and respond with ACKs."""
+    global ACK_COUNT, EXPECT, CUR_SEQ, _frag, B_WIDTH, SEQ_BATCH, _last_activity
 
-                buffer += chunk
-
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-
-                    if line == "TERMINATE":
-                        print(f"{LogColor.WHITE}[CLIENT {client_id}] Termination signal received. Closing session.{LogColor.WHITE}")
-                        return
-
-                    raw_items = line.split(',')
-                    seq_numbers = []
-                    bad_entries = []
-
-                    for item in raw_items:
-                        cleaned = item.strip()
-                        if cleaned.isdigit():
-                            seq_numbers.append(int(cleaned))
-                        elif cleaned != "":
-                            bad_entries.append(item)
-
-                    print("-------------------------------------------")
-                    print("received data: ", seq_numbers)
-                    print("-------------------------------------------")
-
-                    if bad_entries:
-                        print(f"{LogColor.RED}[CLIENT {client_id}] ⚠️ Ignored malformed packets: {bad_entries}{LogColor.WHITE}")
-
-                    if not seq_numbers:
-                        continue
-
-                    print(f"{LogColor.BLUE}[CLIENT {client_id}] Received packet(s): {seq_numbers}{LogColor.WHITE}")
-                    if logger:
-                        logger.writerow([time.time(), "receive", seq_numbers, "", ""])
-
-                    with self.lock:
-                        for seq in seq_numbers:
-                            recv_packets.add(seq)
-                            tot_recv += 1
-
-                        max_received = max(recv_packets)
-                        missing_packets = set(range(1, max_received + 1)) - recv_packets
-                        tot_miss = len(missing_packets)
-
-                        if missing_packets and tot_recv % 1000 == 0:
-                            print(f"{LogColor.YELLOW}[CLIENT {client_id}] Missing packets: {len(missing_packets)} total, last missing: {max(missing_packets)}{LogColor.WHITE}")
-
-                        last_ack = max(seq_numbers)
-                        conn.send(f"{last_ack}\n".encode())
-                        print(f"{LogColor.GREEN}[CLIENT {client_id}] Sent ACK: {last_ack}{LogColor.WHITE}")
-                        if logger:
-                            logger.writerow([time.time(), "ack", "", last_ack, ""])
-
-                        # Sliding window goodput logic
-                        recent_recv_count += len(seq_numbers)
-                        batch_max = max(seq_numbers)
-                        batch_expected = set(range(min(seq_numbers), batch_max + 1))
-                        batch_missing = batch_expected - set(seq_numbers)
-                        recent_miss_count += len(batch_missing)
-
-                        if recent_recv_count >= GOODPUT_EVERY_N_PACKETS:
-                            good_put = (recent_recv_count - recent_miss_count) / recent_recv_count
-                            print(f"{LogColor.WHITE}[CLIENT {client_id}] Good-put (last {recent_recv_count}): {good_put:.4f}{LogColor.WHITE}")
-                            if logger:
-                                logger.writerow([time.time(), "goodput", "", "", f"{good_put:.4f}"])
-                            recent_recv_count = 0
-                            recent_miss_count = 0
-
-                        if self.enable_logging and tot_recv % 100 == 0 and logger:
-                            log_file.flush()
-
+    while ACK_COUNT < TOTAL and _server_running:
+        try:
+            conn.settimeout(1.0)
+            data = conn.recv(B_WIDTH).decode()
+            conn.settimeout(None)
+        except socket.timeout:
+            continue
         except Exception as e:
-            print(f"{LogColor.RED}[CLIENT {client_id}] Error: {e}{LogColor.WHITE}")
-        finally:
-            conn.close()
-            if logger:
-                log_file.close()
-            with self.lock:
-                self.active_clients -= 1
-            print(f"{LogColor.WHITE}[CLIENT {client_id}] Connection closed.{LogColor.WHITE}")
+            print("[!] Connection error during recv:", e)
+            break
 
-    def start_server(self):
+        if not data:
+            print("[!] Client disconnected")
+            break
+
+        _last_activity = time.time()
+        SEQ_BATCH = list(map(int, data.strip().split()))
+
+        print(f"[>] Got {len(SEQ_BATCH)} packets. First: {SEQ_BATCH[0]}, Last: {SEQ_BATCH[-1]}")
+
+        for seq in SEQ_BATCH:
+            OBSERVED.append((seq, time.time()))  # Log received sequence
+
+            # Validate sequence order
+            if seq != EXPECT:
+                if seq not in LAGGED:
+                    LAGGED.append(EXPECT)  # Add expected packet to lagged list
+            else:
+                EXPECT += CHUNK  # Update expectation to next sequence
+                if EXPECT > LIMIT:
+                    EXPECT = 1  # Wrap around if limit exceeded
+
+            ACK_COUNT += 1
+            try:
+                conn.sendall((str(EXPECT) + " ").encode())  # Acknowledge next expected seq
+            except:
+                break
+
+        # Periodically log stats in a separate thread
+        if len(OBSERVED) >= 1000:
+            Thread(target=log_stats, args=(OBSERVED.copy(), len(LAGGED)), daemon=True).start()
+            OBSERVED.clear()
+
+        # Log progress every 100 ACKs
+        if ACK_COUNT % 100 == 0:
+            print(f"[✓] Received: {ACK_COUNT}")
+
+    # Send FIN on completion
+    try:
+        conn.sendall(b"FIN")
+    except:
+        pass
+
+def log_stats(seq_log, misses):
+    """Write received sequences and efficiency stats to log files."""
+    with report_lock:
+        for s, t in seq_log:
+            sink_seq.write(f"{s},{t}\n")
+        eff = 1 - (misses / max(1, len(seq_log)))  # Efficiency: ratio of successful to total
+        sink_eff.write(f"{len(seq_log)},{len(seq_log)-misses},{eff:.3f}\n")
+
+def graceful_exit(signum, frame):
+    """Handle Ctrl+C or termination to cleanly close logs and server."""
+    global _server_running
+    print("\n[!] Server shutting down gracefully...")
+    _server_running = False
+    sink_seq.close()
+    sink_eff.close()
+    sink_flow.close()
+    sys.exit(0)
+
+def launch():
+    """Start the TCP server and listen for incoming connections."""
+    host = socket.gethostname()
+    port = 4001
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(5)
+    server.settimeout(1)  # Allows graceful exit from while loop
+
+    print(f"[+] Server listening on {host}:{port}")
+    Thread(target=pulse_monitor, daemon=True).start()
+
+    while _server_running:
         try:
-            while True:
-                try:
-                    conn, addr = self.server_socket.accept()
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(conn, addr),
-                        daemon=True
-                    )
-                    client_thread.start()
-                except socket.timeout:
-                    with self.lock:
-                        if self.active_clients == 0:
-                            print(f"{LogColor.WHITE}[SERVER] Waiting for connections...{LogColor.WHITE}")
+            conn, addr = server.accept()
+            print(f"[+] Connection from {addr}")
+            Thread(target=handle_connection, args=(conn,), daemon=True).start()
+        except socket.timeout:
+            continue
         except KeyboardInterrupt:
-            print(f"\n{LogColor.WHITE}[SERVER] Interrupted by user. Shutting down...{LogColor.WHITE}")
-        finally:
-            self.server_socket.close()
-            print(f"{LogColor.WHITE}[SERVER] Socket closed. Server exited.{LogColor.WHITE}")
+            graceful_exit(None, None)
+        except Exception as e:
+            print(f"[!] Error accepting connection: {e}")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log", action="store_true", help="Enable CSV logging")
-    args = parser.parse_args()
-
-    server = TCPServer(enable_logging=args.log)
-    server.start_server()
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, graceful_exit)  # Ctrl+C support
+    launch()
